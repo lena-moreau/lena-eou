@@ -62,13 +62,13 @@ class PageResult:
 class RegionSeed:
     region_id: int
     page_count: int
-    first_page: PageResult
 
 
 @dataclass
 class RegionResult:
     region_id: int
     last_modified: str
+    last_modified_gmt: str
     last_page: int
     order_count: int
     compressed_path: Path
@@ -96,6 +96,20 @@ def report_github_error(title: str, message: str) -> None:
 def parse_http_date(value: str | None) -> dt.datetime | None:
     if not value:
         return None
+
+
+def format_http_date_gmt(value: dt.datetime) -> str:
+    return email.utils.format_datetime(value.astimezone(dt.timezone.utc).replace(microsecond=0), usegmt=True)
+
+
+def last_modified_gmt_from_iso(value: str) -> str | None:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return format_http_date_gmt(parsed)
     try:
         parsed = email.utils.parsedate_to_datetime(value)
         if parsed.tzinfo is None:
@@ -231,7 +245,7 @@ def read_compressed_capture(path: Path, region_id: int, temporary_dir: Path) -> 
         plain_path.unlink(missing_ok=True)
 
 
-def discover_first_pages(
+def plan_region_work(
     region_ids: list[int], temporary_dir: Path
 ) -> tuple[dict[int, RegionSeed], list[RegionResult], dict[str, Any]]:
     try:
@@ -242,11 +256,11 @@ def discover_first_pages(
 
     seeds: dict[int, RegionSeed] = {}
     cached_results: list[RegionResult] = []
-    to_fetch: list[int] = []
     now = utc_now()
     for region_id in region_ids:
         cached = previous_regions.get(str(region_id)) if isinstance(previous_regions, dict) else None
         compressed_path = OUTPUT_DIR / f"{region_id}.db.zst"
+        state = None
         try:
             state = read_compressed_capture(compressed_path, region_id, temporary_dir) if compressed_path.is_file() else None
             if state:
@@ -258,9 +272,20 @@ def discover_first_pages(
                     and cached.get("last_page") == page_count
                     and expires_at > now
                 ):
+                    raw_last_modified = cached.get("last_modified_gmt")
+                    if not isinstance(raw_last_modified, str):
+                        raw_last_modified = last_modified_gmt_from_iso(last_modified)
+                    if raw_last_modified is None:
+                        raise ValueError(f"Last-Modified inválido en headers.json para región {region_id}")
                     cached_results.append(
                         RegionResult(
-                            region_id, last_modified, page_count, order_count, compressed_path, iso_utc(expires_at)
+                            region_id,
+                            last_modified,
+                            raw_last_modified,
+                            page_count,
+                            order_count,
+                            compressed_path,
+                            iso_utc(expires_at),
                         )
                     )
                     print(
@@ -270,23 +295,16 @@ def discover_first_pages(
                     continue
         except (KeyError, TypeError, ValueError):
             pass
-        to_fetch.append(region_id)
+        estimated_pages = cached.get("last_page") if isinstance(cached, dict) else None
+        if isinstance(estimated_pages, bool) or not isinstance(estimated_pages, int) or estimated_pages < 1:
+            estimated_pages = state[3] if state else 1
+        seeds[region_id] = RegionSeed(region_id, estimated_pages)
+        print(
+            f"Región {region_id}: estimación de {estimated_pages} páginas desde headers.json; "
+            "la página 1 se pedirá al iniciar su captura.",
+            flush=True,
+        )
 
-    failures: list[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_COUNT, thread_name_prefix="esi-page1") as pool:
-        futures = {pool.submit(fetch_page, region_id, 1): region_id for region_id in to_fetch}
-        for future in concurrent.futures.as_completed(futures):
-            region_id = futures[future]
-            try:
-                first_page = future.result()
-                seeds[region_id] = RegionSeed(region_id, first_page.page_count, first_page)
-                print(f"Página 1/ {first_page.page_count} descubierta para región {region_id}.", flush=True)
-            except Exception as exc:
-                failures.append(f"{region_id}: {exc}")
-    if failures:
-        message = f"No se pudo obtener página 1 de {len(failures)} regiones: " + "; ".join(failures[:20])
-        report_github_error("Falló el inventario de páginas ESI", message)
-        raise CaptureError(message)
     return seeds, cached_results, previous_regions if isinstance(previous_regions, dict) else {}
 
 
@@ -383,15 +401,9 @@ def region_cache_deadline(pages: list[PageResult]) -> dt.datetime:
     return latest_response + dt.timedelta(seconds=3600)
 
 
-def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], str, str, int]:
-    page_count = seed.page_count
-    first_expiry = parse_http_date(seed.first_page.headers.get("expires"))
-    first_page = seed.first_page
-    if first_expiry and first_expiry <= utc_now() + dt.timedelta(seconds=2):
-        first_page = fetch_page(seed.region_id, 1)
-        page_count = first_page.page_count
-    else:
-        page_count = first_page.page_count
+def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], str, str, str, int]:
+    first_page = fetch_page(seed.region_id, 1)
+    page_count = first_page.page_count
 
     captured_pages = [first_page]
     baseline_date = parse_http_date(first_page.headers.get("last-modified"))
@@ -437,14 +449,21 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
         consume(page_number, page)
         if page_number % 50 == 0 or page_number == page_count:
             print(f"  Región {seed.region_id}: {page_number}/{page_count} páginas; {len(orders_by_id):,} órdenes únicas.", flush=True)
-    last_page_modified = parse_http_date(captured_pages[-1].headers.get("last-modified"))
+    last_page_modified_gmt = captured_pages[-1].headers.get("last-modified")
+    last_page_modified = parse_http_date(last_page_modified_gmt)
     if last_page_modified is None:
         raise SnapshotError(
             f"Región {seed.region_id}: última página sin Last-Modified válido",
             snapshot_retry_at(),
         )
     next_request_at = region_cache_deadline(captured_pages)
-    return orders_by_id, iso_utc(last_page_modified), iso_utc(next_request_at), page_count
+    return (
+        orders_by_id,
+        iso_utc(last_page_modified),
+        last_page_modified_gmt,
+        iso_utc(next_request_at),
+        page_count,
+    )
 
 
 def write_sqlite(
@@ -544,7 +563,7 @@ def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
                 f"{seed.page_count} páginas previstas.",
                 flush=True,
             )
-            records, last_modified, next_request_at, actual_pages = fetch_region_orders(seed)
+            records, last_modified, last_modified_gmt, next_request_at, actual_pages = fetch_region_orders(seed)
             compressed = make_region_database(
                 seed.region_id, records, last_modified, next_request_at, actual_pages, staging_dir
             )
@@ -554,7 +573,13 @@ def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
                 flush=True,
             )
             return RegionResult(
-                seed.region_id, last_modified, actual_pages, len(records), compressed, next_request_at
+                seed.region_id,
+                last_modified,
+                last_modified_gmt,
+                actual_pages,
+                len(records),
+                compressed,
+                next_request_at,
             )
         except SnapshotError as exc:
             if attempt >= 3:
@@ -601,7 +626,11 @@ def write_headers_json(
     failed_region_ids: set[int],
 ) -> None:
     regions = {
-        str(result.region_id): {"last_modified": result.last_modified, "last_page": result.last_page}
+        str(result.region_id): {
+            "last_modified": result.last_modified,
+            "last_modified_gmt": result.last_modified_gmt,
+            "last_page": result.last_page,
+        }
         for result in sorted(results, key=lambda item: item.region_id)
     }
     for region_id in failed_region_ids:
@@ -609,9 +638,20 @@ def write_headers_json(
         previous = previous_regions.get(key)
         if (OUTPUT_DIR / f"{region_id}.db.zst").is_file() and isinstance(previous, dict):
             last_modified = previous.get("last_modified")
+            last_modified_gmt = previous.get("last_modified_gmt")
             last_page = previous.get("last_page")
             if isinstance(last_modified, str) and isinstance(last_page, int):
-                regions.setdefault(key, {"last_modified": last_modified, "last_page": last_page})
+                if not isinstance(last_modified_gmt, str):
+                    last_modified_gmt = last_modified_gmt_from_iso(last_modified)
+                if isinstance(last_modified_gmt, str):
+                    regions.setdefault(
+                        key,
+                        {
+                            "last_modified": last_modified,
+                            "last_modified_gmt": last_modified_gmt,
+                            "last_page": last_page,
+                        },
+                    )
     document = {"regions": regions}
     with path.open("w", encoding="utf-8", newline="\n") as output:
         json.dump(document, output, ensure_ascii=False, sort_keys=True, indent=2)
@@ -641,14 +681,25 @@ def publish(
 def main() -> int:
     try:
         region_ids = regions_from_database()
-        print(f"Descubrimiento: leyendo la primera página de {len(region_ids)} regiones con {WORKER_COUNT} conexiones como máximo.", flush=True)
+        print(
+            f"Planificación: usando last_page de headers.json para estimar páginas de "
+            f"{len(region_ids)} regiones; sin peticiones ESI previas.",
+            flush=True,
+        )
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         with tempfile.TemporaryDirectory(prefix=".market-orders-capture-", dir=ROOT) as temp_name:
             staging_dir = Path(temp_name)
-            seeds, cached_results, previous_regions = discover_first_pages(region_ids, staging_dir)
+            seeds, cached_results, previous_regions = plan_region_work(region_ids, staging_dir)
             if not seeds:
-                print("Todas las regiones tienen una captura local con la caché ESI aún vigente; no se hacen peticiones.", flush=True)
+                headers_temp = staging_dir / "headers.json"
+                write_headers_json(headers_temp, cached_results, previous_regions, set())
+                publish([], headers_temp, region_ids, remove_obsolete=False)
+                print(
+                    "Todas las regiones tienen una captura local vigente; no se hacen peticiones ESI. "
+                    "Se actualizaron los metadatos de headers.json si era necesario.",
+                    flush=True,
+                )
                 return 0
             assignments = assign_regions(seeds)
             new_results: list[RegionResult] = []
