@@ -30,6 +30,8 @@ REQUEST_TIMEOUT_SECONDS = 60
 MAX_RETRIES = 5
 WORKER_COUNT = 4
 SNAPSHOT_RETRY_DELAY_SECONDS = 2.5
+FINAL_SNAPSHOT_RETRY_DELAY_SECONDS = 300.0
+MAX_SNAPSHOT_ATTEMPTS = 4
 GITHUB_FILE_LIMIT_BYTES = 100_000_000
 INSERT_BATCH_SIZE = 5000
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,12 +58,14 @@ class PageResult:
     headers: dict[str, str]
     page_count: int
     received_at: dt.datetime
+    status_code: int
 
 
 @dataclass(frozen=True)
 class RegionSeed:
     region_id: int
     page_count: int
+    expected_last_modified_gmt: str | None = None
 
 
 @dataclass
@@ -191,7 +195,7 @@ def fetch_page(region_id: int, page: int) -> PageResult:
                     raise CaptureError(f"Región {region_id}, página {page}: X-Pages inválido o ausente") from exc
                 if page_count < 1 or page > page_count:
                     raise SnapshotError(f"Región {region_id}: página {page} fuera del X-Pages={page_count}")
-                return PageResult(payload, headers, page_count, received_at)
+                return PageResult(payload, headers, page_count, received_at, response.status)
         except urllib.error.HTTPError as exc:
             retryable = exc.code in (420, 429) or 500 <= exc.code <= 599
             if not retryable or attempt >= MAX_RETRIES:
@@ -253,6 +257,8 @@ def plan_region_work(
         previous_regions = previous.get("regions", {}) if isinstance(previous, dict) else {}
     except (OSError, json.JSONDecodeError):
         previous_regions = {}
+    if not isinstance(previous_regions, dict):
+        previous_regions = {}
 
     seeds: dict[int, RegionSeed] = {}
     cached_results: list[RegionResult] = []
@@ -297,10 +303,20 @@ def plan_region_work(
             pass
         estimated_pages = cached.get("last_page") if isinstance(cached, dict) else None
         if isinstance(estimated_pages, bool) or not isinstance(estimated_pages, int) or estimated_pages < 1:
-            estimated_pages = state[3] if state else 1
-        seeds[region_id] = RegionSeed(region_id, estimated_pages)
+            estimated_pages = 1
+            estimate_source = "sin entrada válida en headers.json; se usa 1"
+        else:
+            estimate_source = "headers.json"
+        expected_last_modified_gmt = cached.get("last_modified_gmt") if isinstance(cached, dict) else None
+        if not isinstance(expected_last_modified_gmt, str) and isinstance(cached, dict):
+            previous_last_modified = cached.get("last_modified")
+            if isinstance(previous_last_modified, str):
+                expected_last_modified_gmt = last_modified_gmt_from_iso(previous_last_modified)
+        if not isinstance(expected_last_modified_gmt, str):
+            expected_last_modified_gmt = None
+        seeds[region_id] = RegionSeed(region_id, estimated_pages, expected_last_modified_gmt)
         print(
-            f"Región {region_id}: estimación de {estimated_pages} páginas desde headers.json; "
+            f"Región {region_id}: estimación de {estimated_pages} páginas ({estimate_source}); "
             "la página 1 se pedirá al iniciar su captura.",
             flush=True,
         )
@@ -406,10 +422,30 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
     page_count = first_page.page_count
 
     captured_pages = [first_page]
-    baseline_date = parse_http_date(first_page.headers.get("last-modified"))
+    first_last_modified_gmt = first_page.headers.get("last-modified")
+    baseline_date = parse_http_date(first_last_modified_gmt)
     if baseline_date is None:
+        diagnostic_header_names = (
+            "last-modified",
+            "x-pages",
+            "expires",
+            "etag",
+            "date",
+            "cache-control",
+            "content-type",
+            "x-compatibility-date",
+            "x-esi-cache-status",
+            "x-esi-request-id",
+        )
+        response_headers = {
+            name: first_page.headers.get(name) for name in diagnostic_header_names
+        }
         raise SnapshotError(
-            f"Región {seed.region_id}: página 1 sin Last-Modified válido",
+            f"Región {seed.region_id}: página 1, HTTP {first_page.status_code}; "
+            f"Last-Modified esperado (captura previa)="
+            f"{json.dumps(seed.expected_last_modified_gmt, ensure_ascii=False)}, "
+            f"recibido={json.dumps(first_last_modified_gmt, ensure_ascii=False)}; "
+            f"cabeceras relevantes={json.dumps(response_headers, ensure_ascii=False, sort_keys=True)}",
             snapshot_retry_at(),
         )
     baseline_modified = iso_utc(baseline_date)
@@ -428,7 +464,9 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
         if modified != baseline_modified:
             raise SnapshotError(
                 f"Región {seed.region_id}, página {page_number}: Last-Modified esperado="
-                f"{baseline_modified}, recibido={modified or 'ausente'}",
+                f"{json.dumps(first_last_modified_gmt, ensure_ascii=False)}, "
+                f"recibido={json.dumps(page.headers.get('last-modified'), ensure_ascii=False)} "
+                f"(normalizado esperado={baseline_modified}, recibido={modified or 'null'})",
                 snapshot_retry_at(),
             )
         captured_pages.append(page)
@@ -556,10 +594,10 @@ def make_region_database(
 
 
 def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
-    for attempt in range(1, 4):
+    for attempt in range(1, MAX_SNAPSHOT_ATTEMPTS + 1):
         try:
             print(
-                f"Región {seed.region_id}: inicio de captura, intento {attempt}/3, "
+                f"Región {seed.region_id}: inicio de captura, intento {attempt}/{MAX_SNAPSHOT_ATTEMPTS}, "
                 f"{seed.page_count} páginas previstas.",
                 flush=True,
             )
@@ -582,23 +620,23 @@ def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
                 next_request_at,
             )
         except SnapshotError as exc:
-            if attempt >= 3:
-                report_github_error(
-                    f"Región {seed.region_id}: snapshot inválido",
-                    f"Se agotaron los tres intentos: {exc}",
-                )
+            if attempt >= MAX_SNAPSHOT_ATTEMPTS:
                 raise
-            retry_at = exc.retry_at
-            delay = (
-                max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
-                if retry_at
-                else SNAPSHOT_RETRY_DELAY_SECONDS
-            )
+            if attempt == MAX_SNAPSHOT_ATTEMPTS - 1:
+                delay = FINAL_SNAPSHOT_RETRY_DELAY_SECONDS
+                wait_reason = "espera final de 300s (Expires)"
+            else:
+                retry_at = exc.retry_at
+                delay = (
+                    max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+                    if retry_at
+                    else SNAPSHOT_RETRY_DELAY_SECONDS
+                )
+                wait_reason = "reintento rápido"
             message = (
                 f"Región {seed.region_id}: snapshot inválido ({exc}); "
-                f"reinicio {attempt + 1}/3 en {delay:.1f}s (sin esperar a Expires)."
+                f"reinicio {attempt + 1}/{MAX_SNAPSHOT_ATTEMPTS} en {delay:.1f}s ({wait_reason})."
             )
-            print(f"::warning::{github_escape(message)}", flush=True)
             print(message, flush=True)
             time.sleep(delay)
     raise AssertionError("unreachable")
@@ -621,37 +659,22 @@ def run_worker(worker_index: int, seeds: list[RegionSeed], staging_dir: Path):
 
 def write_headers_json(
     path: Path,
-    results: list[RegionResult],
     previous_regions: dict[str, Any],
-    failed_region_ids: set[int],
+    successful_results: list[RegionResult],
+    region_ids: list[int],
 ) -> None:
+    allowed_ids = {str(region_id) for region_id in region_ids}
     regions = {
-        str(result.region_id): {
+        key: value
+        for key, value in previous_regions.items()
+        if key in allowed_ids and isinstance(value, dict)
+    }
+    for result in successful_results:
+        regions[str(result.region_id)] = {
             "last_modified": result.last_modified,
             "last_modified_gmt": result.last_modified_gmt,
             "last_page": result.last_page,
         }
-        for result in sorted(results, key=lambda item: item.region_id)
-    }
-    for region_id in failed_region_ids:
-        key = str(region_id)
-        previous = previous_regions.get(key)
-        if (OUTPUT_DIR / f"{region_id}.db.zst").is_file() and isinstance(previous, dict):
-            last_modified = previous.get("last_modified")
-            last_modified_gmt = previous.get("last_modified_gmt")
-            last_page = previous.get("last_page")
-            if isinstance(last_modified, str) and isinstance(last_page, int):
-                if not isinstance(last_modified_gmt, str):
-                    last_modified_gmt = last_modified_gmt_from_iso(last_modified)
-                if isinstance(last_modified_gmt, str):
-                    regions.setdefault(
-                        key,
-                        {
-                            "last_modified": last_modified,
-                            "last_modified_gmt": last_modified_gmt,
-                            "last_page": last_page,
-                        },
-                    )
     document = {"regions": regions}
     with path.open("w", encoding="utf-8", newline="\n") as output:
         json.dump(document, output, ensure_ascii=False, sort_keys=True, indent=2)
@@ -692,12 +715,9 @@ def main() -> int:
             staging_dir = Path(temp_name)
             seeds, cached_results, previous_regions = plan_region_work(region_ids, staging_dir)
             if not seeds:
-                headers_temp = staging_dir / "headers.json"
-                write_headers_json(headers_temp, cached_results, previous_regions, set())
-                publish([], headers_temp, region_ids, remove_obsolete=False)
                 print(
                     "Todas las regiones tienen una captura local vigente; no se hacen peticiones ESI. "
-                    "Se actualizaron los metadatos de headers.json si era necesario.",
+                    "headers.json se mantiene sin cambios porque no se escribió ninguna DB.",
                     flush=True,
                 )
                 return 0
@@ -716,8 +736,7 @@ def main() -> int:
 
             results = new_results + cached_results
             headers_temp = staging_dir / "headers.json"
-            failed_region_ids = {region for region, _message in failures}
-            write_headers_json(headers_temp, results, previous_regions, failed_region_ids)
+            write_headers_json(headers_temp, previous_regions, new_results, region_ids)
             publish(
                 [result.compressed_path for result in new_results],
                 headers_temp,
