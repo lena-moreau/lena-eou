@@ -1,0 +1,59 @@
+name: Capture ESI regions
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capture-region-ids
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Capture region IDs from ESI
+        run: python scripts/capture_region_ids.py
+        env:
+          PYTHONUNBUFFERED: "1"
+
+      - name: Commit and push the SQLite snapshot when changed
+        run: |
+          git add data/esi/uni/regions.db
+          if git diff --cached --quiet; then
+            echo "The ESI region ID snapshot is unchanged."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update ESI region ID snapshot"
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Failed to push after multiple attempts."
+          exit 1
