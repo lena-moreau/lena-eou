@@ -82,6 +82,16 @@ def iso_utc(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def github_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def report_github_error(title: str, message: str) -> None:
+    """Make a failure visible as both a log line and an Actions annotation."""
+    safe_title = github_escape(title).replace(":", "%3A").replace(",", "%2C")
+    print(f"::error title={safe_title}::{github_escape(message)}", flush=True)
+
+
 def parse_http_date(value: str | None) -> dt.datetime | None:
     if not value:
         return None
@@ -173,13 +183,28 @@ def fetch_page(region_id: int, page: int) -> PageResult:
                 detail = exc.read(512).decode("utf-8", errors="replace").strip()
                 raise CaptureError(f"Región {region_id}, página {page}: HTTP {exc.code}: {detail}") from exc
             delay = retry_delay(exc.headers, attempt, exc.code)
-            print(f"  Región {region_id}, página {page}: HTTP {exc.code}; espera {delay:.1f}s", file=sys.stderr, flush=True)
+            rate_remaining = exc.headers.get("X-ESI-Error-Limit-Remain", "unknown")
+            rate_reset = exc.headers.get("X-ESI-Error-Limit-Reset", "unknown")
+            retry_after = exc.headers.get("Retry-After", "not provided")
+            message = (
+                f"Región {region_id}, página {page}: HTTP {exc.code}; "
+                f"reintento {attempt + 1}/{MAX_RETRIES}, espera {delay:.1f}s; "
+                f"ESI error limit remaining={rate_remaining}, reset={rate_reset}s, "
+                f"Retry-After={retry_after}."
+            )
+            print(f"::warning::{github_escape(message)}", flush=True)
+            print(f"  {message}", file=sys.stderr, flush=True)
             time.sleep(delay)
         except (TimeoutError, OSError, urllib.error.URLError) as exc:
             if attempt >= MAX_RETRIES:
                 raise CaptureError(f"Región {region_id}, página {page}: error de red: {exc}") from exc
             delay = min(30.0, 2**attempt + random.random())
-            print(f"  Región {region_id}, página {page}: error de red; espera {delay:.1f}s", file=sys.stderr, flush=True)
+            message = (
+                f"Región {region_id}, página {page}: error de red ({exc}); "
+                f"reintento {attempt + 1}/{MAX_RETRIES}, espera {delay:.1f}s."
+            )
+            print(f"::warning::{github_escape(message)}", flush=True)
+            print(f"  {message}", file=sys.stderr, flush=True)
             time.sleep(delay)
     raise AssertionError("unreachable")
 
@@ -258,20 +283,40 @@ def discover_first_pages(
             except Exception as exc:
                 failures.append(f"{region_id}: {exc}")
     if failures:
-        raise CaptureError("No se pudo obtener página 1 de todas las regiones: " + "; ".join(failures[:10]))
+        message = f"No se pudo obtener página 1 de {len(failures)} regiones: " + "; ".join(failures[:20])
+        report_github_error("Falló el inventario de páginas ESI", message)
+        raise CaptureError(message)
     return seeds, cached_results, previous_regions if isinstance(previous_regions, dict) else {}
 
 
 def assign_regions(seeds: dict[int, RegionSeed]) -> list[list[RegionSeed]]:
-    """Greedy longest-processing-time assignment; each region stays in one worker."""
+    """Reserve the largest region for worker 1; LPT-balance the rest over workers 2–4."""
     assignments: list[list[RegionSeed]] = [[] for _ in range(WORKER_COUNT)]
     loads = [0] * WORKER_COUNT
-    for seed in sorted(seeds.values(), key=lambda item: (-item.page_count, item.region_id)):
-        worker = min(range(WORKER_COUNT), key=lambda index: (loads[index], index))
+    ordered = sorted(seeds.values(), key=lambda item: (-item.page_count, item.region_id))
+    if not ordered:
+        return assignments
+
+    largest = ordered[0]
+    assignments[0].append(largest)
+    loads[0] = largest.page_count
+    print(
+        f"Asignación fija: worker 1 recibe solo la región {largest.region_id} "
+        f"({largest.page_count} páginas).",
+        flush=True,
+    )
+
+    for seed in ordered[1:]:
+        worker = min(range(1, WORKER_COUNT), key=lambda index: (loads[index], index))
         assignments[worker].append(seed)
         loads[worker] += seed.page_count
     for worker, (regions, pages) in enumerate(zip(assignments, loads), start=1):
-        print(f"Worker {worker}: {len(regions)} regiones, {pages} páginas asignadas.", flush=True)
+        region_order = ", ".join(f"{seed.region_id}({seed.page_count})" for seed in regions) or "ninguna"
+        print(
+            f"Worker {worker}: {len(regions)} regiones, {pages} páginas asignadas; "
+            f"orden: {region_order}.",
+            flush=True,
+        )
     return assignments
 
 
@@ -364,14 +409,16 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
         observed_pages = [*captured_pages, page]
         if page.page_count != page_count:
             raise SnapshotError(
-                f"Región {seed.region_id}: X-Pages pasó de {page_count} a {page.page_count} en página {page_number}",
+                f"Región {seed.region_id}, página {page_number}: X-Pages esperado={page_count}, "
+                f"recibido={page.page_count}",
                 retry_at_for_pages(observed_pages),
             )
         modified_date = parse_http_date(page.headers.get("last-modified"))
         modified = iso_utc(modified_date) if modified_date else None
         if modified != baseline_modified:
             raise SnapshotError(
-                f"Región {seed.region_id}: Last-Modified cambió o falta en página {page_number}",
+                f"Región {seed.region_id}, página {page_number}: Last-Modified esperado="
+                f"{baseline_modified}, recibido={modified or 'ausente'}",
                 retry_at_for_pages(observed_pages),
             )
         captured_pages.append(page)
@@ -494,7 +541,11 @@ def make_region_database(
 def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
     for attempt in range(1, 4):
         try:
-            print(f"Región {seed.region_id}: captura en su worker (intento {attempt}/3).", flush=True)
+            print(
+                f"Región {seed.region_id}: inicio de captura, intento {attempt}/3, "
+                f"{seed.page_count} páginas previstas.",
+                flush=True,
+            )
             records, last_modified, next_request_at, actual_pages = fetch_region_orders(seed)
             compressed = make_region_database(
                 seed.region_id, records, last_modified, next_request_at, actual_pages, staging_dir
@@ -509,14 +560,19 @@ def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
             )
         except SnapshotError as exc:
             if attempt >= 3:
+                report_github_error(
+                    f"Región {seed.region_id}: snapshot inválido",
+                    f"Se agotaron los tres intentos: {exc}",
+                )
                 raise
             retry_at = exc.retry_at or (utc_now() + dt.timedelta(seconds=30))
             delay = max(1.0, (retry_at - utc_now()).total_seconds())
-            print(
-                f"Región {seed.region_id}: snapshot cambió; se reiniciará cuando venza la caché ESI "
-                f"(intento {attempt}/3, espera {delay:.1f}s).",
-                flush=True,
+            message = (
+                f"Región {seed.region_id}: snapshot inválido ({exc}); "
+                f"reinicio {attempt + 1}/3 tras esperar {delay:.1f}s hasta que venza la caché ESI."
             )
+            print(f"::warning::{github_escape(message)}", flush=True)
+            print(message, flush=True)
             time.sleep(delay)
     raise AssertionError("unreachable")
 
@@ -530,7 +586,9 @@ def run_worker(worker_index: int, seeds: list[RegionSeed], staging_dir: Path):
             results.append(capture_region(seed, staging_dir))
         except Exception as exc:
             errors.append((seed.region_id, str(exc)))
-            print(f"Worker {worker_index}: fallo región {seed.region_id}: {exc}", file=sys.stderr, flush=True)
+            message = f"Worker {worker_index}, región {seed.region_id}: {type(exc).__name__}: {exc}"
+            report_github_error(f"Captura fallida en región {seed.region_id}", message)
+            print(message, file=sys.stderr, flush=True)
     return results, errors
 
 
@@ -624,11 +682,14 @@ def main() -> int:
         )
         if failures:
             summary = "; ".join(f"{region}: {message}" for region, message in failures[:10])
-            print(f"Regiones no capturadas tras los reintentos: {summary}", file=sys.stderr, flush=True)
+            message = f"{len(failures)} regiones no se capturaron. Fallos: {summary}"
+            report_github_error("La captura terminó con regiones fallidas", message)
+            print(message, file=sys.stderr, flush=True)
             return 1
         return 0
     except (CaptureError, OSError, sqlite3.Error, ValueError, zstandard.ZstdError) as exc:
-        print(f"Captura de órdenes fallida: {exc}", file=sys.stderr, flush=True)
+        report_github_error("Captura de órdenes fallida", str(exc))
+        print(f"Captura de órdenes fallida: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 1
 
 
