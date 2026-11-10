@@ -9,7 +9,6 @@ import json
 import math
 import os
 import random
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -26,7 +25,7 @@ import zstandard
 
 ESI = "https://esi.evetech.net/latest"
 USER_AGENT = "Lena-EOU-Market-Orders/0.1 (+https://github.com/lena-moreau/lena-eou)"
-COMPATIBILITY_DATE = "2026-11-10"
+COMPATIBILITY_DATE = "2020-01-01"
 REQUEST_TIMEOUT_SECONDS = 60
 MAX_RETRIES = 5
 WORKER_COUNT = 4
@@ -45,12 +44,17 @@ class CaptureError(RuntimeError):
 class SnapshotError(CaptureError):
     """Page metadata changed during one region's capture."""
 
+    def __init__(self, message: str, retry_at: dt.datetime | None = None):
+        super().__init__(message)
+        self.retry_at = retry_at
+
 
 @dataclass(frozen=True)
 class PageResult:
     orders: list[dict[str, Any]]
     headers: dict[str, str]
     page_count: int
+    received_at: dt.datetime
 
 
 @dataclass(frozen=True)
@@ -63,11 +67,11 @@ class RegionSeed:
 @dataclass
 class RegionResult:
     region_id: int
-    page_count: int
+    last_modified: str
+    last_page: int
     order_count: int
     compressed_path: Path
-    headers_by_page: dict[str, dict[str, str]]
-    captured_at_utc: str
+    next_request_at_utc: str
 
 
 def utc_now() -> dt.datetime:
@@ -111,18 +115,6 @@ def lower_headers(headers: Any) -> dict[str, str]:
     return {key.lower(): value for key, value in headers.items()}
 
 
-def parse_http_date(value: str | None) -> dt.datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = email.utils.parsedate_to_datetime(value)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
-        return parsed.astimezone(dt.timezone.utc)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
 def regions_from_database(path: Path = REGION_DB) -> list[int]:
     if not path.is_file():
         raise CaptureError(f"No existe {path.relative_to(ROOT)}; ejecuta primero el workflow de regiones ESI.")
@@ -160,6 +152,7 @@ def fetch_page(region_id: int, page: int) -> PageResult:
     for attempt in range(MAX_RETRIES + 1):
         try:
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                received_at = utc_now()
                 headers = lower_headers(response.headers)
                 try:
                     payload = json.loads(response.read())
@@ -173,7 +166,7 @@ def fetch_page(region_id: int, page: int) -> PageResult:
                     raise CaptureError(f"Región {region_id}, página {page}: X-Pages inválido o ausente") from exc
                 if page_count < 1 or page > page_count:
                     raise SnapshotError(f"Región {region_id}: página {page} fuera del X-Pages={page_count}")
-                return PageResult(payload, headers, page_count)
+                return PageResult(payload, headers, page_count, received_at)
         except urllib.error.HTTPError as exc:
             retryable = exc.code in (420, 429) or 500 <= exc.code <= 599
             if not retryable or attempt >= MAX_RETRIES:
@@ -191,7 +184,30 @@ def fetch_page(region_id: int, page: int) -> PageResult:
     raise AssertionError("unreachable")
 
 
-def discover_first_pages(region_ids: list[int]) -> tuple[dict[int, RegionSeed], list[RegionResult]]:
+def read_compressed_capture(path: Path, region_id: int, temporary_dir: Path) -> tuple[str, int, str, int] | None:
+    plain_path = temporary_dir / f"cached-{region_id}.db"
+    try:
+        with path.open("rb") as source, plain_path.open("wb") as output:
+            zstandard.ZstdDecompressor().copy_stream(source, output)
+        with sqlite3.connect(f"{plain_path.resolve().as_uri()}?mode=ro", uri=True) as connection:
+            capture = connection.execute(
+                "SELECT region_id, last_modified, order_count FROM capture"
+            ).fetchone()
+            cache = connection.execute(
+                "SELECT next_request_at_utc, page_count FROM esi_cache WHERE region_id = ?", (region_id,)
+            ).fetchone()
+        if not capture or not cache or capture[0] != region_id:
+            return None
+        return capture[1], capture[2], cache[0], cache[1]
+    except (OSError, sqlite3.Error, zstandard.ZstdError):
+        return None
+    finally:
+        plain_path.unlink(missing_ok=True)
+
+
+def discover_first_pages(
+    region_ids: list[int], temporary_dir: Path
+) -> tuple[dict[int, RegionSeed], list[RegionResult], dict[str, Any]]:
     try:
         previous = json.loads(HEADERS_PATH.read_text(encoding="utf-8"))
         previous_regions = previous.get("regions", {}) if isinstance(previous, dict) else {}
@@ -206,34 +222,29 @@ def discover_first_pages(region_ids: list[int]) -> tuple[dict[int, RegionSeed], 
         cached = previous_regions.get(str(region_id)) if isinstance(previous_regions, dict) else None
         compressed_path = OUTPUT_DIR / f"{region_id}.db.zst"
         try:
-            cached_pages = int(cached["pages"])
-            cached_orders = int(cached["unique_orders"])
-            cached_headers = cached["headers_by_page"]
-            if not isinstance(cached_headers, dict) or cached_pages <= 0:
-                raise ValueError("headers cache format invalid")
-            if any(not isinstance(cached_headers.get(str(page)), dict) for page in range(1, cached_pages + 1)):
-                raise ValueError("per-page headers missing")
-            expiry_values = [
-                parse_http_date(cached_headers[str(page)].get("expires"))
-                for page in range(1, cached_pages + 1)
-            ]
-            captured_at = cached["captured_at_utc"]
-            usable = (
-                compressed_path.is_file()
-                and cached_orders >= 0
-                and isinstance(captured_at, str)
-                and all(expiry is not None for expiry in expiry_values)
-                and max(expiry_values) > now
-            )
+            state = read_compressed_capture(compressed_path, region_id, temporary_dir) if compressed_path.is_file() else None
+            if state:
+                last_modified, order_count, next_request_text, page_count = state
+                expires_at = dt.datetime.fromisoformat(next_request_text.replace("Z", "+00:00"))
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("last_modified") == last_modified
+                    and cached.get("last_page") == page_count
+                    and expires_at > now
+                ):
+                    cached_results.append(
+                        RegionResult(
+                            region_id, last_modified, page_count, order_count, compressed_path, iso_utc(expires_at)
+                        )
+                    )
+                    print(
+                        f"Región {region_id}: reutilizo captura hasta {iso_utc(expires_at)} según Expires de ESI.",
+                        flush=True,
+                    )
+                    continue
         except (KeyError, TypeError, ValueError):
-            usable = False
-        if usable:
-            cached_results.append(
-                RegionResult(region_id, cached_pages, cached_orders, compressed_path, cached_headers, captured_at)
-            )
-            print(f"Región {region_id}: se reutiliza la captura; todas sus páginas siguen en caché ESI.", flush=True)
-        else:
-            to_fetch.append(region_id)
+            pass
+        to_fetch.append(region_id)
 
     failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_COUNT, thread_name_prefix="esi-page1") as pool:
@@ -248,7 +259,7 @@ def discover_first_pages(region_ids: list[int]) -> tuple[dict[int, RegionSeed], 
                 failures.append(f"{region_id}: {exc}")
     if failures:
         raise CaptureError("No se pudo obtener página 1 de todas las regiones: " + "; ".join(failures[:10]))
-    return seeds, cached_results
+    return seeds, cached_results, previous_regions if isinstance(previous_regions, dict) else {}
 
 
 def assign_regions(seeds: dict[int, RegionSeed]) -> list[list[RegionSeed]]:
@@ -269,21 +280,6 @@ def int_field(order: dict[str, Any], field: str, region_id: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise CaptureError(f"Región {region_id}: {field} inválido en orden {order.get('order_id')!r}")
     return value
-
-
-def encode_range(value: Any, region_id: int, order_id: int) -> int:
-    named = {"station": 0, "solarsystem": 1, "region": 2}
-    if value in named:
-        return named[value]
-    if not isinstance(value, str):
-        raise CaptureError(f"Región {region_id}: range inválido en orden {order_id}")
-    try:
-        distance = int(value)
-    except ValueError as exc:
-        raise CaptureError(f"Región {region_id}: range desconocido en orden {order_id}") from exc
-    if str(distance) != value or not 0 <= distance <= 32764:
-        raise CaptureError(f"Región {region_id}: range fuera de rango en orden {order_id}")
-    return distance + 3
 
 
 def normalize_order(order: dict[str, Any], region_id: int) -> tuple[Any, ...]:
@@ -309,6 +305,9 @@ def normalize_order(order: dict[str, Any], region_id: int) -> tuple[Any, ...]:
         raise CaptureError(f"Región {region_id}: issued inválido en orden {order_id}") from exc
     if issued.tzinfo is None:
         raise CaptureError(f"Región {region_id}: issued sin zona horaria en orden {order_id}")
+    order_range = order.get("range")
+    if not isinstance(order_range, str):
+        raise CaptureError(f"Región {region_id}: range inválido en orden {order_id}")
     return (
         order_id,
         values["type_id"],
@@ -319,41 +318,71 @@ def normalize_order(order: dict[str, Any], region_id: int) -> tuple[Any, ...]:
         values["volume_total"],
         values["min_volume"],
         int(is_buy_order),
-        int(issued.timestamp()),
+        issued_text,
         values["duration"],
-        encode_range(order.get("range"), region_id, order_id),
+        order_range,
     )
 
 
-def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], dict[str, dict[str, str]], int]:
+def retry_at_for_pages(pages: list[PageResult]) -> dt.datetime:
+    expiries = [parse_http_date(page.headers.get("expires")) for page in pages]
+    if expiries and all(value is not None for value in expiries):
+        return max(value for value in expiries if value is not None) + dt.timedelta(seconds=1)
+    latest_response = max((page.received_at for page in pages), default=utc_now())
+    return latest_response + dt.timedelta(seconds=3601)
+
+
+def region_cache_deadline(pages: list[PageResult]) -> dt.datetime:
+    expiries = [parse_http_date(page.headers.get("expires")) for page in pages]
+    if all(value is not None for value in expiries):
+        return max(value for value in expiries if value is not None)
+    latest_response = max((page.received_at for page in pages), default=utc_now())
+    return latest_response + dt.timedelta(seconds=3600)
+
+
+def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], str, str, int]:
     page_count = seed.page_count
-    baseline_modified = seed.first_page.headers.get("last-modified")
     first_expiry = parse_http_date(seed.first_page.headers.get("expires"))
     first_page = seed.first_page
     if first_expiry and first_expiry <= utc_now() + dt.timedelta(seconds=2):
         first_page = fetch_page(seed.region_id, 1)
         page_count = first_page.page_count
-        baseline_modified = first_page.headers.get("last-modified")
+    else:
+        page_count = first_page.page_count
 
-    pages: dict[str, dict[str, str]] = {"1": first_page.headers}
+    captured_pages = [first_page]
+    baseline_date = parse_http_date(first_page.headers.get("last-modified"))
+    if baseline_date is None:
+        raise SnapshotError(
+            f"Región {seed.region_id}: página 1 sin Last-Modified válido",
+            retry_at_for_pages(captured_pages),
+        )
+    baseline_modified = iso_utc(baseline_date)
     orders_by_id: dict[int, tuple[Any, ...]] = {}
 
     def consume(page_number: int, page: PageResult) -> None:
+        observed_pages = [*captured_pages, page]
         if page.page_count != page_count:
             raise SnapshotError(
-                f"Región {seed.region_id}: X-Pages pasó de {page_count} a {page.page_count} en página {page_number}"
+                f"Región {seed.region_id}: X-Pages pasó de {page_count} a {page.page_count} en página {page_number}",
+                retry_at_for_pages(observed_pages),
             )
-        modified = page.headers.get("last-modified")
-        if baseline_modified and modified != baseline_modified:
-            raise SnapshotError(f"Región {seed.region_id}: Last-Modified cambió en página {page_number}")
-        pages[str(page_number)] = page.headers
+        modified_date = parse_http_date(page.headers.get("last-modified"))
+        modified = iso_utc(modified_date) if modified_date else None
+        if modified != baseline_modified:
+            raise SnapshotError(
+                f"Región {seed.region_id}: Last-Modified cambió o falta en página {page_number}",
+                retry_at_for_pages(observed_pages),
+            )
+        captured_pages.append(page)
         for raw_order in page.orders:
             row = normalize_order(raw_order, seed.region_id)
             order_id = row[0]
             previous = orders_by_id.get(order_id)
             if previous is not None and previous != row:
                 raise SnapshotError(
-                    f"Región {seed.region_id}: order_id {order_id} aparece con valores distintos entre páginas"
+                    f"Región {seed.region_id}: order_id {order_id} aparece con valores distintos entre páginas",
+                    retry_at_for_pages(captured_pages),
                 )
             orders_by_id[order_id] = row
 
@@ -363,14 +392,22 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], d
         consume(page_number, page)
         if page_number % 50 == 0 or page_number == page_count:
             print(f"  Región {seed.region_id}: {page_number}/{page_count} páginas; {len(orders_by_id):,} órdenes únicas.", flush=True)
-    return orders_by_id, pages, page_count
+    last_page_modified = parse_http_date(captured_pages[-1].headers.get("last-modified"))
+    if last_page_modified is None:
+        raise SnapshotError(
+            f"Región {seed.region_id}: última página sin Last-Modified válido",
+            retry_at_for_pages(captured_pages),
+        )
+    next_request_at = region_cache_deadline(captured_pages)
+    return orders_by_id, iso_utc(last_page_modified), iso_utc(next_request_at), page_count
 
 
 def write_sqlite(
     region_id: int,
     records: dict[int, tuple[Any, ...]],
+    last_modified: str,
+    next_request_at_utc: str,
     page_count: int,
-    captured_at: str,
     path: Path,
 ) -> None:
     connection = sqlite3.connect(path)
@@ -390,17 +427,23 @@ def write_sqlite(
                 volume_total INTEGER NOT NULL,
                 min_volume INTEGER NOT NULL,
                 is_buy_order INTEGER NOT NULL CHECK(is_buy_order IN (0, 1)),
-                issued INTEGER NOT NULL,
+                issued TEXT NOT NULL,
                 duration INTEGER NOT NULL,
-                range_code INTEGER NOT NULL
+                "range" TEXT NOT NULL
             )"""
         )
         connection.execute(
             """CREATE TABLE capture (
-                region_id INTEGER NOT NULL,
-                captured_at_utc TEXT NOT NULL,
-                page_count INTEGER NOT NULL,
-                order_count INTEGER NOT NULL
+                region_id INTEGER PRIMARY KEY CHECK(region_id > 0),
+                last_modified TEXT NOT NULL,
+                order_count INTEGER NOT NULL CHECK(order_count >= 0)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE esi_cache (
+                region_id INTEGER PRIMARY KEY REFERENCES capture(region_id),
+                next_request_at_utc TEXT NOT NULL,
+                page_count INTEGER NOT NULL CHECK(page_count > 0)
             )"""
         )
         batch: list[tuple[Any, ...]] = []
@@ -412,7 +455,10 @@ def write_sqlite(
         if batch:
             connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
         connection.execute(
-            "INSERT INTO capture VALUES (?, ?, ?, ?)", (region_id, captured_at, page_count, len(records))
+            "INSERT INTO capture VALUES (?, ?, ?)", (region_id, last_modified, len(records))
+        )
+        connection.execute(
+            "INSERT INTO esi_cache VALUES (?, ?, ?)", (region_id, next_request_at_utc, page_count)
         )
         connection.commit()
         connection.execute("VACUUM")
@@ -425,13 +471,14 @@ def write_sqlite(
 def make_region_database(
     region_id: int,
     records: dict[int, tuple[Any, ...]],
+    last_modified: str,
+    next_request_at_utc: str,
     page_count: int,
-    captured_at: str,
     staging_dir: Path,
 ) -> Path:
     plain_path = staging_dir / f"{region_id}.db"
     compressed_path = staging_dir / f"{region_id}.db.zst"
-    write_sqlite(region_id, records, page_count, captured_at, plain_path)
+    write_sqlite(region_id, records, last_modified, next_request_at_utc, page_count, plain_path)
     with plain_path.open("rb") as source, compressed_path.open("wb") as output:
         zstandard.ZstdCompressor(level=22, write_checksum=True, write_content_size=True).copy_stream(source, output)
     plain_path.unlink()
@@ -444,72 +491,90 @@ def make_region_database(
     return compressed_path
 
 
-def capture_region(seed: RegionSeed, captured_at: str, staging_dir: Path) -> RegionResult:
+def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
     for attempt in range(1, 4):
         try:
             print(f"Región {seed.region_id}: captura en su worker (intento {attempt}/3).", flush=True)
-            records, headers_by_page, actual_pages = fetch_region_orders(seed)
-            compressed = make_region_database(seed.region_id, records, actual_pages, captured_at, staging_dir)
+            records, last_modified, next_request_at, actual_pages = fetch_region_orders(seed)
+            compressed = make_region_database(
+                seed.region_id, records, last_modified, next_request_at, actual_pages, staging_dir
+            )
             print(
                 f"Región {seed.region_id}: {actual_pages} páginas, {len(records):,} órdenes; "
                 f"{compressed.stat().st_size:,} bytes comprimidos.",
                 flush=True,
             )
-            return RegionResult(seed.region_id, actual_pages, len(records), compressed, headers_by_page, captured_at)
-        except SnapshotError:
+            return RegionResult(
+                seed.region_id, last_modified, actual_pages, len(records), compressed, next_request_at
+            )
+        except SnapshotError as exc:
             if attempt >= 3:
                 raise
-            delay = 2 + random.random() * 2
-            print(f"Región {seed.region_id}: snapshot cambió; se reintentará en {delay:.1f}s.", flush=True)
+            retry_at = exc.retry_at or (utc_now() + dt.timedelta(seconds=30))
+            delay = max(1.0, (retry_at - utc_now()).total_seconds())
+            print(
+                f"Región {seed.region_id}: snapshot cambió; se reiniciará cuando venza la caché ESI "
+                f"(intento {attempt}/3, espera {delay:.1f}s).",
+                flush=True,
+            )
             time.sleep(delay)
-            refreshed = fetch_page(seed.region_id, 1)
-            seed = RegionSeed(seed.region_id, refreshed.page_count, refreshed)
     raise AssertionError("unreachable")
 
 
-def run_worker(worker_index: int, seeds: list[RegionSeed], captured_at: str, staging_dir: Path):
+def run_worker(worker_index: int, seeds: list[RegionSeed], staging_dir: Path):
     results: list[RegionResult] = []
     errors: list[tuple[int, str]] = []
     for index, seed in enumerate(seeds, start=1):
         print(f"Worker {worker_index}: región {index}/{len(seeds)} (ID {seed.region_id}).", flush=True)
         try:
-            results.append(capture_region(seed, captured_at, staging_dir))
+            results.append(capture_region(seed, staging_dir))
         except Exception as exc:
             errors.append((seed.region_id, str(exc)))
             print(f"Worker {worker_index}: fallo región {seed.region_id}: {exc}", file=sys.stderr, flush=True)
     return results, errors
 
 
-def write_headers_json(path: Path, results: list[RegionResult], captured_at: str) -> None:
-    document = {
-        "captured_at_utc": captured_at,
-        "workers": WORKER_COUNT,
-        "regions": {
-            str(result.region_id): {
-                "pages": result.page_count,
-                "unique_orders": result.order_count,
-                "captured_at_utc": result.captured_at_utc,
-                "headers_by_page": result.headers_by_page,
-            }
-            for result in sorted(results, key=lambda item: item.region_id)
-        },
+def write_headers_json(
+    path: Path,
+    results: list[RegionResult],
+    previous_regions: dict[str, Any],
+    failed_region_ids: set[int],
+) -> None:
+    regions = {
+        str(result.region_id): {"last_modified": result.last_modified, "last_page": result.last_page}
+        for result in sorted(results, key=lambda item: item.region_id)
     }
+    for region_id in failed_region_ids:
+        key = str(region_id)
+        previous = previous_regions.get(key)
+        if (OUTPUT_DIR / f"{region_id}.db.zst").is_file() and isinstance(previous, dict):
+            last_modified = previous.get("last_modified")
+            last_page = previous.get("last_page")
+            if isinstance(last_modified, str) and isinstance(last_page, int):
+                regions.setdefault(key, {"last_modified": last_modified, "last_page": last_page})
+    document = {"regions": regions}
     with path.open("w", encoding="utf-8", newline="\n") as output:
-        json.dump(document, output, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        json.dump(document, output, ensure_ascii=False, sort_keys=True, indent=2)
         output.write("\n")
         output.flush()
         os.fsync(output.fileno())
 
 
-def publish(staged_files: list[Path], staged_headers: Path, region_ids: list[int]) -> None:
+def publish(
+    staged_files: list[Path],
+    staged_headers: Path,
+    region_ids: list[int],
+    remove_obsolete: bool,
+) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for staged in staged_files:
         final_path = OUTPUT_DIR / staged.name
         os.replace(staged, final_path)
-    expected = {f"{region_id}.db.zst" for region_id in region_ids}
-    for existing in OUTPUT_DIR.glob("*.db.zst"):
-        if existing.name not in expected:
-            existing.unlink()
+    if remove_obsolete:
+        expected = {f"{region_id}.db.zst" for region_id in region_ids}
+        for existing in OUTPUT_DIR.glob("*.db.zst"):
+            if existing.name not in expected:
+                existing.unlink()
     os.replace(staged_headers, HEADERS_PATH)
 
 
@@ -517,21 +582,20 @@ def main() -> int:
     try:
         region_ids = regions_from_database()
         print(f"Descubrimiento: leyendo la primera página de {len(region_ids)} regiones con {WORKER_COUNT} conexiones como máximo.", flush=True)
-        seeds, cached_results = discover_first_pages(region_ids)
-        if not seeds:
-            print("Todas las regiones tienen una captura local y ESI mantiene vigentes sus cachés; no se hacen peticiones ni se reescriben archivos.", flush=True)
-            return 0
-        assignments = assign_regions(seeds)
-        captured_at = iso_utc(utc_now())
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.TemporaryDirectory(prefix=".market-orders-capture-", dir=OUTPUT_DIR) as temp_name:
+        with tempfile.TemporaryDirectory(prefix=".market-orders-capture-", dir=ROOT) as temp_name:
             staging_dir = Path(temp_name)
+            seeds, cached_results, previous_regions = discover_first_pages(region_ids, staging_dir)
+            if not seeds:
+                print("Todas las regiones tienen una captura local con la caché ESI aún vigente; no se hacen peticiones.", flush=True)
+                return 0
+            assignments = assign_regions(seeds)
             new_results: list[RegionResult] = []
             failures: list[tuple[int, str]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_COUNT, thread_name_prefix="esi-region") as pool:
                 futures = {
-                    pool.submit(run_worker, index, seeds_for_worker, captured_at, staging_dir): index
+                    pool.submit(run_worker, index, seeds_for_worker, staging_dir): index
                     for index, seeds_for_worker in enumerate(assignments, start=1)
                 }
                 for future in concurrent.futures.as_completed(futures):
@@ -539,26 +603,29 @@ def main() -> int:
                     new_results.extend(worker_results)
                     failures.extend(worker_errors)
 
-            if failures:
-                summary = "; ".join(f"{region}: {message}" for region, message in failures[:10])
-                raise CaptureError(
-                    f"No se publica ningún archivo: fallaron {len(failures)} regiones. {summary}"
-                )
             results = new_results + cached_results
-            if len(results) != len(region_ids):
-                raise CaptureError(f"Captura incompleta: {len(results)} de {len(region_ids)} regiones")
-
             headers_temp = staging_dir / "headers.json"
-            write_headers_json(headers_temp, results, captured_at)
-            publish([result.compressed_path for result in new_results], headers_temp, region_ids)
+            failed_region_ids = {region for region, _message in failures}
+            write_headers_json(headers_temp, results, previous_regions, failed_region_ids)
+            publish(
+                [result.compressed_path for result in new_results],
+                headers_temp,
+                region_ids,
+                remove_obsolete=not failures,
+            )
 
-        total_pages = sum(result.page_count for result in results)
+        total_pages = sum(result.last_page for result in results)
         total_orders = sum(result.order_count for result in results)
         print(
-            f"Publicado: {len(results)} regiones, {total_pages:,} páginas y {total_orders:,} órdenes; "
+            f"Publicadas {len(new_results)} regiones nuevas/actualizadas; {len(failures)} regiones fallidas, "
+            f"{total_pages:,} páginas y {total_orders:,} órdenes conocidas; "
             f"JSON de headers en {HEADERS_PATH.relative_to(ROOT)}.",
             flush=True,
         )
+        if failures:
+            summary = "; ".join(f"{region}: {message}" for region, message in failures[:10])
+            print(f"Regiones no capturadas tras los reintentos: {summary}", file=sys.stderr, flush=True)
+            return 1
         return 0
     except (CaptureError, OSError, sqlite3.Error, ValueError, zstandard.ZstdError) as exc:
         print(f"Captura de órdenes fallida: {exc}", file=sys.stderr, flush=True)

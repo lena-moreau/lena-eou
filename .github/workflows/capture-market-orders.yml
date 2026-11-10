@@ -35,8 +35,10 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
 
-      - name: Commit and push complete regional snapshots
+      - name: Commit and push completed regional snapshots
+        if: always()
         run: |
+          mkdir -p data/esi/mkt
           git add -A data/esi/mkt
           if git diff --cached --quiet; then
             echo "Regional market snapshots and headers are unchanged."
