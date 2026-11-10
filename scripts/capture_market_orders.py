@@ -29,6 +29,7 @@ COMPATIBILITY_DATE = "2020-01-01"
 REQUEST_TIMEOUT_SECONDS = 60
 MAX_RETRIES = 5
 WORKER_COUNT = 4
+SNAPSHOT_RETRY_DELAY_SECONDS = 2.5
 GITHUB_FILE_LIMIT_BYTES = 100_000_000
 INSERT_BATCH_SIZE = 5000
 ROOT = Path(__file__).resolve().parents[1]
@@ -369,12 +370,9 @@ def normalize_order(order: dict[str, Any], region_id: int) -> tuple[Any, ...]:
     )
 
 
-def retry_at_for_pages(pages: list[PageResult]) -> dt.datetime:
-    expiries = [parse_http_date(page.headers.get("expires")) for page in pages]
-    if expiries and all(value is not None for value in expiries):
-        return max(value for value in expiries if value is not None) + dt.timedelta(seconds=1)
-    latest_response = max((page.received_at for page in pages), default=utc_now())
-    return latest_response + dt.timedelta(seconds=3601)
+def snapshot_retry_at() -> dt.datetime:
+    """Retry a mixed snapshot promptly; ESI Expires does not gate this restart."""
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=SNAPSHOT_RETRY_DELAY_SECONDS)
 
 
 def region_cache_deadline(pages: list[PageResult]) -> dt.datetime:
@@ -400,7 +398,7 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
     if baseline_date is None:
         raise SnapshotError(
             f"Región {seed.region_id}: página 1 sin Last-Modified válido",
-            retry_at_for_pages(captured_pages),
+            snapshot_retry_at(),
         )
     baseline_modified = iso_utc(baseline_date)
     orders_by_id: dict[int, tuple[Any, ...]] = {}
@@ -411,7 +409,7 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
             raise SnapshotError(
                 f"Región {seed.region_id}, página {page_number}: X-Pages esperado={page_count}, "
                 f"recibido={page.page_count}",
-                retry_at_for_pages(observed_pages),
+                snapshot_retry_at(),
             )
         modified_date = parse_http_date(page.headers.get("last-modified"))
         modified = iso_utc(modified_date) if modified_date else None
@@ -419,7 +417,7 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
             raise SnapshotError(
                 f"Región {seed.region_id}, página {page_number}: Last-Modified esperado="
                 f"{baseline_modified}, recibido={modified or 'ausente'}",
-                retry_at_for_pages(observed_pages),
+                snapshot_retry_at(),
             )
         captured_pages.append(page)
         for raw_order in page.orders:
@@ -429,7 +427,7 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
             if previous is not None and previous != row:
                 raise SnapshotError(
                     f"Región {seed.region_id}: order_id {order_id} aparece con valores distintos entre páginas",
-                    retry_at_for_pages(captured_pages),
+                    snapshot_retry_at(),
                 )
             orders_by_id[order_id] = row
 
@@ -443,7 +441,7 @@ def fetch_region_orders(seed: RegionSeed) -> tuple[dict[int, tuple[Any, ...]], s
     if last_page_modified is None:
         raise SnapshotError(
             f"Región {seed.region_id}: última página sin Last-Modified válido",
-            retry_at_for_pages(captured_pages),
+            snapshot_retry_at(),
         )
     next_request_at = region_cache_deadline(captured_pages)
     return orders_by_id, iso_utc(last_page_modified), iso_utc(next_request_at), page_count
@@ -565,11 +563,15 @@ def capture_region(seed: RegionSeed, staging_dir: Path) -> RegionResult:
                     f"Se agotaron los tres intentos: {exc}",
                 )
                 raise
-            retry_at = exc.retry_at or (utc_now() + dt.timedelta(seconds=30))
-            delay = max(1.0, (retry_at - utc_now()).total_seconds())
+            retry_at = exc.retry_at
+            delay = (
+                max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+                if retry_at
+                else SNAPSHOT_RETRY_DELAY_SECONDS
+            )
             message = (
                 f"Región {seed.region_id}: snapshot inválido ({exc}); "
-                f"reinicio {attempt + 1}/3 tras esperar {delay:.1f}s hasta que venza la caché ESI."
+                f"reinicio {attempt + 1}/3 en {delay:.1f}s (sin esperar a Expires)."
             )
             print(f"::warning::{github_escape(message)}", flush=True)
             print(message, flush=True)
