@@ -694,12 +694,7 @@ def capture_region(seed: RegionSeed, staging_dir: Path, force: bool) -> RegionRe
                 )
                 wait_reason = "espera hasta Expires antes del último intento"
             else:
-                retry_at = exc.retry_at
-                delay = (
-                    max(0.0, (retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
-                    if retry_at
-                    else SNAPSHOT_RETRY_DELAY_SECONDS
-                )
+                delay = SNAPSHOT_RETRY_DELAY_SECONDS
                 wait_reason = "reintento rápido"
             message = (
                 f"Región {seed.region_id}: snapshot inválido ({exc}); "
