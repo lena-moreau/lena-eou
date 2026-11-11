@@ -83,7 +83,9 @@ class RegionCaptureJob:
     next_page: int = 1
     page_count: int | None = None
     captured_pages: list[PageResult] = field(default_factory=list)
-    orders_by_id: dict[int, tuple[Any, ...]] = field(default_factory=dict)
+    # Keep distinct versions of the same order when any value besides last_modified differs.
+    # The content tuple is the key; last_modified selects the newest copy of identical content.
+    orders_by_content: dict[tuple[Any, ...], tuple[Any, ...]] = field(default_factory=dict)
     request_attempt: int = 0
 
 
@@ -224,24 +226,17 @@ def fetch_page(region_id: int, page: int, request_attempt: int = 0) -> PageResul
 
 def read_compressed_capture(
     path: Path, region_id: int, temporary_dir: Path
-) -> tuple[str, int, str, int, bool] | None:
+) -> tuple[int, bool] | None:
     plain_path = temporary_dir / f"cached-{region_id}.db"
     try:
         with path.open("rb") as source, plain_path.open("wb") as output:
             zstandard.ZstdDecompressor().copy_stream(source, output)
         with sqlite3.connect(f"{plain_path.resolve().as_uri()}?mode=ro", uri=True) as connection:
-            capture = connection.execute(
-                "SELECT region_id, last_modified, order_count FROM capture"
-            ).fetchone()
-            cache = connection.execute(
-                "SELECT next_request_at_utc, page_count FROM esi_cache WHERE region_id = ?", (region_id,)
-            ).fetchone()
+            order_count = int(connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0])
             order_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(orders)")
             }
-        if not capture or not cache or capture[0] != region_id:
-            return None
-        return capture[1], capture[2], cache[0], cache[1], "last_modified" in order_columns
+        return order_count, "last_modified" in order_columns
     except (OSError, sqlite3.Error, zstandard.ZstdError):
         return None
     finally:
@@ -269,14 +264,19 @@ def plan_region_work(
         expires_at = None
         try:
             state = read_compressed_capture(compressed_path, region_id, temporary_dir) if compressed_path.is_file() else None
-            if state:
-                last_modified, order_count, next_request_text, page_count, has_order_last_modified = state
+            if state and isinstance(cached, dict):
+                order_count, has_order_last_modified = state
+                last_modified = cached.get("last_modified")
+                next_request_text = cached.get("next_request_at_utc")
+                page_count = cached.get("last_page")
+                if not isinstance(last_modified, str) or not isinstance(next_request_text, str):
+                    raise ValueError(f"Faltan metadatos de captura en headers.json para región {region_id}")
+                if isinstance(page_count, bool) or not isinstance(page_count, int) or page_count < 1:
+                    raise ValueError(f"last_page inválido en headers.json para región {region_id}")
                 expires_at = dt.datetime.fromisoformat(next_request_text.replace("Z", "+00:00"))
                 cache_matches_headers = (
-                    isinstance(cached, dict)
-                    and has_order_last_modified
+                    has_order_last_modified
                     and cached.get("last_modified") == last_modified
-                    and cached.get("last_page") == page_count
                 )
                 if (
                     cache_matches_headers
@@ -416,7 +416,7 @@ def region_cache_deadline(pages: list[PageResult]) -> dt.datetime:
     return latest_response + dt.timedelta(seconds=3600)
 
 
-def advance_region_capture(job: RegionCaptureJob) -> tuple[dict[int, tuple[Any, ...]], str, str, str, int] | None:
+def advance_region_capture(job: RegionCaptureJob) -> tuple[dict[tuple[Any, ...], tuple[Any, ...]], str, str, str, int] | None:
     """Fetch one page for a region. None means enqueue its next page immediately."""
     seed = job.seed
     page_number = job.next_page
@@ -444,19 +444,15 @@ def advance_region_capture(job: RegionCaptureJob) -> tuple[dict[int, tuple[Any, 
 
     for raw_order in page.orders:
         row = normalize_order(raw_order, seed.region_id, page_last_modified)
-        order_id = row[0]
-        previous = job.orders_by_id.get(order_id)
-        if previous is not None and previous[:-1] != row[:-1]:
-            raise CaptureError(
-                f"Región {seed.region_id}: order_id {order_id} aparece con valores distintos entre páginas",
-            )
-        if previous is None:
-            job.orders_by_id[order_id] = row
+        content_key = row[:-1]
+        previous = job.orders_by_content.get(content_key)
+        if previous is None or row[-1] > previous[-1]:
+            job.orders_by_content[content_key] = row
 
     if page_number % 50 == 0 or page_number == job.page_count:
         print(
             f"  Región {seed.region_id}: {page_number}/{job.page_count} páginas; "
-            f"{len(job.orders_by_id):,} órdenes únicas.", flush=True,
+            f"{len(job.orders_by_content):,} filas de órdenes.", flush=True,
         )
     if page_number != page.page_count:
         job.next_page += 1
@@ -464,17 +460,14 @@ def advance_region_capture(job: RegionCaptureJob) -> tuple[dict[int, tuple[Any, 
 
     next_request_at = region_cache_deadline(job.captured_pages)
     return (
-        job.orders_by_id, page_last_modified, last_modified_gmt,
+        job.orders_by_content, page_last_modified, last_modified_gmt,
         iso_utc(next_request_at), job.page_count or 1,
     )
 
 
 def write_sqlite(
     region_id: int,
-    records: dict[int, tuple[Any, ...]],
-    last_modified: str,
-    next_request_at_utc: str,
-    page_count: int,
+    records: dict[tuple[Any, ...], tuple[Any, ...]],
     path: Path,
 ) -> None:
     connection = sqlite3.connect(path)
@@ -485,7 +478,7 @@ def write_sqlite(
         connection.execute("PRAGMA temp_store=MEMORY")
         connection.execute(
             """CREATE TABLE orders (
-                order_id INTEGER PRIMARY KEY,
+                order_id INTEGER NOT NULL,
                 type_id INTEGER NOT NULL,
                 location_id INTEGER NOT NULL,
                 system_id INTEGER NOT NULL,
@@ -500,34 +493,14 @@ def write_sqlite(
                 last_modified TEXT NOT NULL
             )"""
         )
-        connection.execute(
-            """CREATE TABLE capture (
-                region_id INTEGER PRIMARY KEY CHECK(region_id > 0),
-                last_modified TEXT NOT NULL,
-                order_count INTEGER NOT NULL CHECK(order_count >= 0)
-            )"""
-        )
-        connection.execute(
-            """CREATE TABLE esi_cache (
-                region_id INTEGER PRIMARY KEY REFERENCES capture(region_id),
-                next_request_at_utc TEXT NOT NULL,
-                page_count INTEGER NOT NULL CHECK(page_count > 0)
-            )"""
-        )
         batch: list[tuple[Any, ...]] = []
-        for order_id in sorted(records):
-            batch.append(records[order_id])
+        for content_key in sorted(records):
+            batch.append(records[content_key])
             if len(batch) == INSERT_BATCH_SIZE:
                 connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
                 batch.clear()
         if batch:
             connection.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch)
-        connection.execute(
-            "INSERT INTO capture VALUES (?, ?, ?)", (region_id, last_modified, len(records))
-        )
-        connection.execute(
-            "INSERT INTO esi_cache VALUES (?, ?, ?)", (region_id, next_request_at_utc, page_count)
-        )
         connection.commit()
         connection.execute("VACUUM")
         if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
@@ -539,14 +512,11 @@ def write_sqlite(
 def make_region_database(
     region_id: int,
     records: dict[int, tuple[Any, ...]],
-    last_modified: str,
-    next_request_at_utc: str,
-    page_count: int,
     staging_dir: Path,
 ) -> Path:
     plain_path = staging_dir / f"{region_id}.db"
     compressed_path = staging_dir / f"{region_id}.db.zst"
-    write_sqlite(region_id, records, last_modified, next_request_at_utc, page_count, plain_path)
+    write_sqlite(region_id, records, plain_path)
     with plain_path.open("rb") as source, compressed_path.open("wb") as output:
         zstandard.ZstdCompressor(level=22, write_checksum=True, write_content_size=True).copy_stream(source, output)
     plain_path.unlink()
@@ -593,7 +563,7 @@ def run_worker(worker_index: int, seeds: list[RegionSeed], staging_dir: Path):
                 continue
             records, last_modified, last_modified_gmt, next_request_at, actual_pages = capture
             compressed = make_region_database(
-                seed.region_id, records, last_modified, next_request_at, actual_pages, staging_dir
+                seed.region_id, records, staging_dir
             )
             print(
                 f"Región {seed.region_id}: {actual_pages} páginas, {len(records):,} órdenes; "
@@ -645,6 +615,7 @@ def write_headers_json(
             "last_modified": result.last_modified,
             "last_modified_gmt": result.last_modified_gmt,
             "last_page": result.last_page,
+            "next_request_at_utc": result.next_request_at_utc,
         }
     document = {"regions": regions}
     with path.open("w", encoding="utf-8", newline="\n") as output:
