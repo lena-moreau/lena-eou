@@ -359,7 +359,7 @@ def assign_regions(seeds: dict[int, RegionSeed]) -> list[list[RegionSeed]]:
     loads[0] = largest.page_count
     print(
         f"Asignación fija: worker 1 recibe solo la región {largest.region_id} "
-        f"({largest.page_count} páginas).",
+        f"({largest.page_count} páginas estimadas).",
         flush=True,
     )
 
@@ -368,10 +368,10 @@ def assign_regions(seeds: dict[int, RegionSeed]) -> list[list[RegionSeed]]:
         assignments[worker].append(seed)
         loads[worker] += seed.page_count
     for worker, (regions, pages) in enumerate(zip(assignments, loads), start=1):
-        region_order = ", ".join(f"{seed.region_id}({seed.page_count})" for seed in regions) or "ninguna"
+        region_order = ", ".join(f"{seed.region_id}(~{seed.page_count})" for seed in regions) or "ninguna"
         print(
-            f"Worker {worker}: {len(regions)} regiones, {pages} páginas asignadas; "
-            f"orden: {region_order}.",
+            f"Worker {worker}: {len(regions)} regiones, {pages} páginas estimadas para reparto; "
+            f"orden por estimación: {region_order}.",
             flush=True,
         )
     return assignments
@@ -449,6 +449,10 @@ def fetch_region_orders(
 ) -> tuple[dict[int, tuple[Any, ...]], str, str, str, int]:
     first_page = fetch_page(seed.region_id, 1)
     page_count = first_page.page_count
+    print(
+        f"Región {seed.region_id}: página 1 recibida; X-Pages real de ESI={page_count}.",
+        flush=True,
+    )
 
     captured_pages = [first_page]
     first_last_modified_gmt = first_page.headers.get("last-modified")
@@ -651,8 +655,7 @@ def capture_region(seed: RegionSeed, staging_dir: Path, force: bool) -> RegionRe
     for attempt in range(1, MAX_SNAPSHOT_ATTEMPTS + 1):
         try:
             print(
-                f"Región {seed.region_id}: inicio de captura, intento {attempt}/{MAX_SNAPSHOT_ATTEMPTS}, "
-                f"{seed.page_count} páginas previstas.",
+                f"Región {seed.region_id}: inicio de captura, intento {attempt}/{MAX_SNAPSHOT_ATTEMPTS}.",
                 flush=True,
             )
             records, last_modified, last_modified_gmt, next_request_at, actual_pages = fetch_region_orders(
