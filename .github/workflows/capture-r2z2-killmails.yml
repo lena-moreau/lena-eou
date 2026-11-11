@@ -1,0 +1,38 @@
+name: Capture R2Z2 killmails through ESI
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capture-r2z2-killmails
+  queue: max
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Listen to R2Z2 and fetch through ESI
+        run: python scripts/capture_r2z2_killmails.py
+        env:
+          CAPTURE_DURATION_SECONDS: "1800"
+          CHECKPOINT_SECONDS: "300"
+          PYTHONUNBUFFERED: "1"
